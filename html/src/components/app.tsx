@@ -57,7 +57,7 @@ console.log('===hihihi!!!!!!==')
 export class App extends Component {
     render() {
         return (
-            <>
+            <div>
                 <Terminal
                     id="terminal-container"
                     wsUrl={wsUrl}
@@ -72,7 +72,7 @@ export class App extends Component {
                     <h1>测试一下嵌入</h1>
                     <h1>测试一下嵌入</h1>
                 </div>
-            </>
+            </div>
         );
     }
 }
