@@ -52,17 +52,27 @@ const flowControl = {
     lowWater: 4,
 } as FlowControl;
 
+console.log('===hihihi!!!!!!==')
+
 export class App extends Component {
     render() {
         return (
-            <Terminal
-                id="terminal-container"
-                wsUrl={wsUrl}
-                tokenUrl={tokenUrl}
-                clientOptions={clientOptions}
-                termOptions={termOptions}
-                flowControl={flowControl}
-            />
+            <>
+                <Terminal
+                    id="terminal-container"
+                    wsUrl={wsUrl}
+                    tokenUrl={tokenUrl}
+                    clientOptions={clientOptions}
+                    termOptions={termOptions}
+                    flowControl={flowControl}
+                />
+                <div>
+                    <h1>测试一下嵌入</h1>
+                    <h1>测试一下嵌入</h1>
+                    <h1>测试一下嵌入</h1>
+                    <h1>测试一下嵌入</h1>
+                </div>
+            </>
         );
     }
 }
