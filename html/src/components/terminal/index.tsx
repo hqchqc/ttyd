@@ -84,8 +84,11 @@ export class Xterm extends Component<Props> {
 
     render({ id }: Props) {
         return (
-            <div id={id} ref={c => (this.container = c)}>
-                <ZmodemAddon ref={c => (this.zmodemAddon = c)} sender={this.sendData} />
+            <div id={id} ref={(c) => (this.container = c)}>
+                <ZmodemAddon ref={(c) => (this.zmodemAddon = c)} sender={this.sendData} />
+                <div>
+                    <h3>嵌入测试</h3>
+                </div>
             </div>
         );
     }
@@ -118,6 +121,8 @@ export class Xterm extends Component<Props> {
             this.terminal.dispose();
         }
 
+        console.log('======= ✌ ========');
+
         this.socket = new WebSocket(this.props.url, ['tty']);
         this.terminal = new Terminal(this.props.options);
         const { socket, terminal, container, fitAddon, overlayAddon } = this;
@@ -137,7 +142,7 @@ export class Xterm extends Component<Props> {
         terminal.loadAddon(new WebLinksAddon());
         terminal.loadAddon(this.zmodemAddon);
 
-        terminal.onTitleChange(data => {
+        terminal.onTitleChange((data) => {
             if (data && data !== '') {
                 document.title = data + ' | ' + this.title;
             }
@@ -218,7 +223,7 @@ export class Xterm extends Component<Props> {
                 break;
             case Command.SET_PREFERENCES:
                 const preferences = JSON.parse(textDecoder.decode(data));
-                Object.keys(preferences).forEach(key => {
+                Object.keys(preferences).forEach((key) => {
                     console.log(`[ttyd] setting ${key}: ${preferences[key]}`);
                     terminal.setOption(key, preferences[key]);
                 });

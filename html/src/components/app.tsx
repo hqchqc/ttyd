@@ -39,6 +39,13 @@ const termOptions = {
 
 export class App extends Component {
     render() {
-        return <Xterm id="terminal-container" url={url} options={termOptions} />;
+        return (
+            <div>
+                <Xterm id="terminal-container" url={url} options={termOptions} />;
+                <div>
+                    <h2>嵌入测试</h2>
+                </div>
+            </div>
+        );
     }
 }
