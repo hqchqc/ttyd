@@ -47,8 +47,6 @@ build
 # Clion files
 .idea/
 
-# VSCode files
-.vscode/
-
 # Project files
+html.h
 !init.d

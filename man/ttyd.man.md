@@ -7,13 +7,12 @@ ttyd 1 "September 2016" ttyd "User Manual"
 # SYNOPSIS
   **ttyd** [options] \<command\> [\<arguments...\>]
 
-# DESCRIPTION
+# Description
   ttyd is a command-line tool for sharing terminal over the web that runs in *nix and windows systems, with the following features:
 
-  - Built on top of Libwebsockets with libuv for speed
+  - Built on top of Libwebsockets with C for speed
   - Fully-featured terminal based on Xterm.js with CJK (Chinese, Japanese, Korean) and IME support
-  - Graphical ZMODEM integration with lrzsz support
-  - Sixel image output support
+  - Graphical ZMODEM integration with lrzsz support 
   - SSL support based on OpenSSL
   - Run any custom command with options
   - Basic authentication support and many other custom options
@@ -26,14 +25,8 @@ ttyd 1 "September 2016" ttyd "User Manual"
   -i, --interface <interface>
       Network interface to bind (eg: eth0), or UNIX domain socket path (eg: /var/run/ttyd.sock)
 
-  -U, --socket-owner
-      User owner of the UNIX domain socket file, when enabled (eg: user:group)
-
   -c, --credential USER[:PASSWORD]
       Credential for Basic Authentication (format: username:password)
-
-  -H, --auth-header <name>
-      HTTP Header name for auth proxy, this will configure ttyd to let a HTTP reverse proxy handle authentication
 
   -u, --uid <uid>
       User id to run with
@@ -44,9 +37,6 @@ ttyd 1 "September 2016" ttyd "User Manual"
   -s, --signal <signal string>
       Signal to send to the command when exit it (default: 1, SIGHUP)
 
-  -w, --cwd <path>
-      Working directory to be set for the child program
-
   -a, --url-arg
       Allow client to send command line arguments in URL (eg: http://localhost:7681?arg=foo&arg=bar)
 
@@ -54,7 +44,7 @@ ttyd 1 "September 2016" ttyd "User Manual"
       Do not allow clients to write to the TTY
 
   -t, --client-option <key=value>
-      Send option to client (format: key=value), repeat to add more options, see **CLIENT OPTOINS** for details
+      Send option to client (format: key=value), repeat to add more options
 
   -T, --terminal-type
       Terminal type to report, default: xterm-256color
@@ -73,12 +63,6 @@ ttyd 1 "September 2016" ttyd "User Manual"
 
   -I, --index <index file>
       Custom index.html path
-  
-  -b, --base-path
-      Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)
-
-  -P, --ping-interval
-      Websocket ping interval(sec) (default: 300)
 
   -6, --ipv6
       Enable IPv6 support
@@ -104,40 +88,7 @@ ttyd 1 "September 2016" ttyd "User Manual"
   -h, --help
       Print this text and exit
 
-# CLIENT OPTOINS
-ttyd has a mechanism to pass server side command-line arguments to the browser page which is called **client options**:
-
-```bash
--t, --client-option     Send option to client (format: key=value), repeat to add more options
-```
-
-## Basic usage
-
-- `-t rendererType=canvas`: use the `canvas` renderer for xterm.js (default: `webgl`)
-- `-t disableLeaveAlert=true`: disable the leave page alert
-- `-t disableResizeOverlay=true`: disable the terminal resize overlay
-- `-t disableReconnect=true`: prevent the terminal from reconnecting on connection error/close
-- `-t enableZmodem=true`: enable [ZMODEM](https://en.wikipedia.org/wiki/ZMODEM) / [lrzsz](https://ohse.de/uwe/software/lrzsz.html) file transfer support
-- `-t enableTrzsz=true`: enable [trzsz](https://trzsz.github.io) file transfer support
-- `-t enableSixel=true`: enable [Sixel](https://en.wikipedia.org/wiki/Sixel) image output support ([Usage](https://saitoha.github.io/libsixel/))
-- `-t titleFixed=hello`: set a fixed title for the browser window
-- `-t fontSize=20`: change the font size of the terminal
-
-## Advanced usage
-
-You can use the client option to change all the settings of xterm defined in [ITerminalOptions](https://xtermjs.org/docs/api/terminal/interfaces/iterminaloptions/), examples:
-
-- `-t cursorStyle=bar`: set cursor style to `bar`
-- `-t lineHeight=1.5`: set line-height to `1.5`
-- `-t 'theme={"background": "green"}'`: set background color to `green`
-
-to try the example options above, run:
-
-```bash
-ttyd -t cursorStyle=bar -t lineHeight=1.5 -t 'theme={"background": "green"}' bash
-```
-
-# EXAMPLES
+# Examples
   ttyd starts web server at port 7681 by default, you can use the -p option to change it, the command will be started with arguments as options. For example, run:
   
 ```  
@@ -160,7 +111,7 @@ openssl req -new -x509 -days 365 -key ca.key -subj "/C=CN/ST=GD/L=SZ/O=Acme, Inc
 
 # server certificate (for multiple domains, change subjectAltName to: DNS:example.com,DNS:www.example.com)
 openssl req -newkey rsa:2048 -nodes -keyout server.key -subj "/C=CN/ST=GD/L=SZ/O=Acme, Inc./CN=localhost" -out server.csr
-openssl x509 -sha256 -req -extfile <(printf "subjectAltName=DNS:localhost") -days 365 -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt
+openssl x509 -req -extfile <(printf "subjectAltName=DNS:localhost") -days 365 -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt
 
 # client certificate (the p12/pem format may be useful for some clients)
 openssl req -newkey rsa:2048 -nodes -keyout client.key -subj "/C=CN/ST=GD/L=SZ/O=Acme, Inc./CN=client" -out client.csr
@@ -188,22 +139,6 @@ curl --insecure --cert client.p12[:password] -v https://localhost:7681
 
   - Sharing single docker container with multiple clients: docker run -it --rm -p 7681:7681 tsl0922/ttyd.
   - Creating new docker container for each client: ttyd docker run -it --rm ubuntu.
-
-# Nginx reverse proxy
-
-Sample config to proxy ttyd under the `/ttyd` path:
-
-```nginx
-location ~ ^/ttyd(.*)$ {
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_pass http://127.0.0.1:7681/$1;
-}
-```
 
 # AUTHOR
   Shuanglei Tao \<tsl0922@gmail.com\> Visit https://github.com/tsl0922/ttyd to get more information and report bugs.

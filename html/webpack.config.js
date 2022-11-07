@@ -1,10 +1,9 @@
 const path = require('path');
-const { merge } = require('webpack-merge');
-const ESLintPlugin = require('eslint-webpack-plugin');
+const merge = require('webpack-merge');
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
-const MiniCssExtractPlugin = require('mini-css-extract-plugin');
-const CssMinimizerPlugin = require('css-minimizer-webpack-plugin');
+const MiniCssExtractPlugin = require("mini-css-extract-plugin");
+const OptimizeCSSAssetsPlugin = require("optimize-css-assets-webpack-plugin");
 const TerserPlugin = require('terser-webpack-plugin');
 
 const devMode = process.env.NODE_ENV !== 'production';
@@ -12,48 +11,44 @@ const devMode = process.env.NODE_ENV !== 'production';
 const baseConfig = {
     context: path.resolve(__dirname, 'src'),
     entry: {
-        app: './index.tsx',
+        app: './index.tsx'
     },
     output: {
         path: path.resolve(__dirname, 'dist'),
-        filename: devMode ? '[name].js' : '[name].[contenthash].js',
+        filename: devMode ? '[name].js' : '[name].[hash].js',
     },
     module: {
         rules: [
             {
+                test: /\.ts$/,
+                enforce: 'pre',
+                use: 'tslint-loader',
+            },
+            {
                 test: /\.tsx?$/,
                 use: 'ts-loader',
-                exclude: /node_modules/,
+                exclude: /node_modules/
             },
             {
                 test: /\.s?[ac]ss$/,
-                use: [devMode ? 'style-loader' : MiniCssExtractPlugin.loader, 'css-loader', 'sass-loader'],
+                use: [
+                    devMode ? 'style-loader' : MiniCssExtractPlugin.loader,
+                    'css-loader',
+                    'sass-loader',
+                ],
             },
-            {
-                test: /xterm-addon-image-worker/,
-                type: 'asset/inline',
-                generator: {
-                    dataUrl: content => {
-                        return content.toString();
-                    },
-                },
-            },
-        ],
+        ]
     },
     resolve: {
-        extensions: ['.tsx', '.ts', '.js'],
+        extensions: [ '.tsx', '.ts', '.js' ]
     },
     plugins: [
-        new ESLintPlugin({
-            context: path.resolve(__dirname, '.'),
-            extensions: ['js', 'jsx', 'ts', 'tsx'],
-        }),
-        new CopyWebpackPlugin({
-            patterns: [{ from: './favicon.png', to: '.' }],
-        }),
+        new CopyWebpackPlugin([
+            { from: './favicon.png', to: '.' }
+        ], {}),
         new MiniCssExtractPlugin({
-            filename: devMode ? '[name].css' : '[name].[contenthash].css',
-            chunkFilename: devMode ? '[id].css' : '[id].[contenthash].css',
+            filename: devMode ? '[name].css' : '[name].[hash].css',
+            chunkFilename: devMode ? '[id].css' : '[id].[hash].css',
         }),
         new HtmlWebpackPlugin({
             inject: false,
@@ -62,49 +57,47 @@ const baseConfig = {
                 collapseWhitespace: true,
             },
             title: 'ttyd - Terminal',
-            template: './template.html',
-        }),
+            template: './template.html'
+        })
     ],
-    performance: {
-        hints: false,
+    performance : {
+        hints : false
     },
+    devtool: 'source-map',
 };
 
-const devConfig = {
+const devConfig =  {
     mode: 'development',
     devServer: {
-        static: path.join(__dirname, 'dist'),
+        contentBase: path.join(__dirname, 'dist'),
         compress: true,
         port: 9000,
-        client: {
-            overlay: {
-                errors: true,
-                warnings: false,
-            },
-        },
-        proxy: [
-            {
-                context: ['/token', '/ws'],
-                target: 'http://localhost:7681',
-                ws: true,
-            },
-        ],
-        webSocketServer: {
-            type: 'sockjs',
-            options: {
-                path: '/sockjs-node',
-            },
-        },
-    },
-    devtool: 'inline-source-map',
+        proxy: [{
+            context: ['/auth_token.js', '/ws'],
+            target: 'http://localhost:7681',
+            ws: true
+        }]
+    }
 };
 
 const prodConfig = {
     mode: 'production',
     optimization: {
-        minimizer: [new TerserPlugin(), new CssMinimizerPlugin()],
-    },
-    devtool: 'source-map',
+        minimizer: [
+            new TerserPlugin({
+                sourceMap: true
+            }),
+            new OptimizeCSSAssetsPlugin({
+                cssProcessorOptions: {
+                    map: {
+                        inline: false,
+                        annotation: true
+                    }
+                }
+            }),
+        ]
+    }
 };
+
 
 module.exports = merge(baseConfig, devMode ? devConfig : prodConfig);

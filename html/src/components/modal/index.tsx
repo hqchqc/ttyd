@@ -1,4 +1,4 @@
-import { h, Component, ComponentChildren } from 'preact';
+import { Component, ComponentChildren, h } from 'preact';
 
 import './modal.scss';
 
@@ -8,7 +8,7 @@ interface Props {
 }
 
 export class Modal extends Component<Props> {
-    constructor(props: Props) {
+    constructor(props) {
         super(props);
     }
 

@@ -1,395 +1,428 @@
-#include <errno.h>
-#include <json.h>
-#include <libwebsockets.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/queue.h>
+#include <sys/select.h>
+#include <sys/types.h>
+#include <pthread.h>
 
-#include "pty.h"
+#if defined(__OpenBSD__) || defined(__APPLE__)
+#include <util.h>
+#elif defined(__FreeBSD__)
+#include <libutil.h>
+#else
+#include <pty.h>
+#endif
+
+#include <libwebsockets.h>
+#include <json.h>
+
 #include "server.h"
 #include "utils.h"
 
 // initial message list
-static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
+char initial_cmds[] = {
+        SET_WINDOW_TITLE,
+        SET_PREFERENCES
+};
 
-static int send_initial_message(struct lws *wsi, int index) {
-  unsigned char message[LWS_PRE + 1 + 4096];
-  unsigned char *p = &message[LWS_PRE];
-  char buffer[128];
-  int n = 0;
+int
+send_initial_message(struct lws *wsi, int index) {
+    unsigned char message[LWS_PRE + 1 + 4096];
+    unsigned char *p = &message[LWS_PRE];
+    char buffer[128];
+    int n = 0;
 
-  char cmd = initial_cmds[index];
-  switch (cmd) {
-    case SET_WINDOW_TITLE:
-      gethostname(buffer, sizeof(buffer) - 1);
-      n = sprintf((char *)p, "%c%s (%s)", cmd, server->command, buffer);
-      break;
-    case SET_PREFERENCES:
-      n = sprintf((char *)p, "%c%s", cmd, server->prefs_json);
-      break;
-    default:
-      break;
-  }
-
-  return lws_write(wsi, p, (size_t)n, LWS_WRITE_BINARY);
-}
-
-static json_object *parse_window_size(const char *buf, size_t len, uint16_t *cols, uint16_t *rows) {
-  json_tokener *tok = json_tokener_new();
-  json_object *obj = json_tokener_parse_ex(tok, buf, len);
-  struct json_object *o = NULL;
-
-  if (json_object_object_get_ex(obj, "columns", &o)) *cols = (uint16_t)json_object_get_int(o);
-  if (json_object_object_get_ex(obj, "rows", &o)) *rows = (uint16_t)json_object_get_int(o);
-
-  json_tokener_free(tok);
-  return obj;
-}
-
-static bool check_host_origin(struct lws *wsi) {
-  char buf[256];
-  memset(buf, 0, sizeof(buf));
-  int len = lws_hdr_copy(wsi, buf, (int)sizeof(buf), WSI_TOKEN_ORIGIN);
-  if (len <= 0) return false;
-
-  const char *prot, *address, *path;
-  int port;
-  if (lws_parse_uri(buf, &prot, &address, &port, &path)) return false;
-  if (port == 80 || port == 443) {
-    sprintf(buf, "%s", address);
-  } else {
-    sprintf(buf, "%s:%d", address, port);
-  }
-
-  char host_buf[256];
-  memset(host_buf, 0, sizeof(host_buf));
-  len = lws_hdr_copy(wsi, host_buf, (int)sizeof(host_buf), WSI_TOKEN_HOST);
-
-  return len > 0 && strcasecmp(buf, host_buf) == 0;
-}
-
-static pty_ctx_t *pty_ctx_init(struct pss_tty *pss) {
-  pty_ctx_t *ctx = xmalloc(sizeof(pty_ctx_t));
-  ctx->pss = pss;
-  ctx->ws_closed = false;
-  return ctx;
-}
-
-static void pty_ctx_free(pty_ctx_t *ctx) { free(ctx); }
-
-static void process_read_cb(pty_process *process, pty_buf_t *buf, bool eof) {
-  pty_ctx_t *ctx = (pty_ctx_t *)process->ctx;
-  if (ctx->ws_closed) {
-    pty_buf_free(buf);
-    return;
-  }
-
-  if (eof && !process_running(process))
-    ctx->pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
-  else
-    ctx->pss->pty_buf = buf;
-  lws_callback_on_writable(ctx->pss->wsi);
-}
-
-static void process_exit_cb(pty_process *process) {
-  pty_ctx_t *ctx = (pty_ctx_t *)process->ctx;
-  if (ctx->ws_closed) {
-    lwsl_notice("process killed with signal %d, pid: %d\n", process->exit_signal, process->pid);
-    goto done;
-  }
-
-  lwsl_notice("process exited with code %d, pid: %d\n", process->exit_code, process->pid);
-  ctx->pss->process = NULL;
-  ctx->pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
-  lws_callback_on_writable(ctx->pss->wsi);
-
-done:
-  pty_ctx_free(ctx);
-}
-
-static char **build_args(struct pss_tty *pss) {
-  int i, n = 0;
-  char **argv = xmalloc((server->argc + pss->argc + 1) * sizeof(char *));
-
-  for (i = 0; i < server->argc; i++) {
-    argv[n++] = server->argv[i];
-  }
-
-  for (i = 0; i < pss->argc; i++) {
-    argv[n++] = pss->args[i];
-  }
-
-  argv[n] = NULL;
-
-  return argv;
-}
-
-static char **build_env(struct pss_tty *pss) {
-  int i = 0, n = 2;
-  char **envp = xmalloc(n * sizeof(char *));
-
-  // TERM
-  envp[i] = xmalloc(36);
-  snprintf(envp[i], 36, "TERM=%s", server->terminal_type);
-  i++;
-
-  // TTYD_USER
-  if (strlen(pss->user) > 0) {
-    envp = xrealloc(envp, (++n) * sizeof(char *));
-    envp[i] = xmalloc(40);
-    snprintf(envp[i], 40, "TTYD_USER=%s", pss->user);
-    i++;
-  }
-
-  envp[i] = NULL;
-
-  return envp;
-}
-
-static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows) {
-  pty_process *process = process_init((void *)pty_ctx_init(pss), server->loop, build_args(pss), build_env(pss));
-  if (server->cwd != NULL) process->cwd = strdup(server->cwd);
-  if (columns > 0) process->columns = columns;
-  if (rows > 0) process->rows = rows;
-  if (pty_spawn(process, process_read_cb, process_exit_cb) != 0) {
-    lwsl_err("pty_spawn: %d (%s)\n", errno, strerror(errno));
-    process_free(process);
-    return false;
-  }
-  lwsl_notice("started process, pid: %d\n", process->pid);
-  pss->process = process;
-  lws_callback_on_writable(pss->wsi);
-
-  return true;
-}
-
-static void wsi_output(struct lws *wsi, pty_buf_t *buf) {
-  if (buf == NULL) return;
-  char *message = xmalloc(LWS_PRE + 1 + buf->len);
-  char *ptr = message + LWS_PRE;
-
-  *ptr = OUTPUT;
-  memcpy(ptr + 1, buf->base, buf->len);
-  size_t n = buf->len + 1;
-
-  if (lws_write(wsi, (unsigned char *)ptr, n, LWS_WRITE_BINARY) < n) {
-    lwsl_err("write OUTPUT to WS\n");
-  }
-
-  free(message);
-}
-
-static bool check_auth(struct lws *wsi, struct pss_tty *pss) {
-  if (server->auth_header != NULL) {
-    return lws_hdr_custom_copy(wsi, pss->user, sizeof(pss->user), server->auth_header, strlen(server->auth_header)) > 0;
-  }
-
-  if (server->credential != NULL) {
-    char buf[256];
-    size_t n = lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_AUTHORIZATION);
-    return n >= 7 && strstr(buf, "Basic ") && !strcmp(buf + 6, server->credential);
-  }
-
-  return true;
-}
-
-int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
-  struct pss_tty *pss = (struct pss_tty *)user;
-  char buf[256];
-  size_t n = 0;
-
-  switch (reason) {
-    case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
-      if (server->once && server->client_count > 0) {
-        lwsl_warn("refuse to serve WS client due to the --once option.\n");
-        return 1;
-      }
-      if (server->max_clients > 0 && server->client_count == server->max_clients) {
-        lwsl_warn("refuse to serve WS client due to the --max-clients option.\n");
-        return 1;
-      }
-      if (!check_auth(wsi, pss)) return 1;
-
-      n = lws_hdr_copy(wsi, pss->path, sizeof(pss->path), WSI_TOKEN_GET_URI);
-#if defined(LWS_ROLE_H2)
-      if (n <= 0) n = lws_hdr_copy(wsi, pss->path, sizeof(pss->path), WSI_TOKEN_HTTP_COLON_PATH);
-#endif
-      if (strncmp(pss->path, endpoints.ws, n) != 0) {
-        lwsl_warn("refuse to serve WS client for illegal ws path: %s\n", pss->path);
-        return 1;
-      }
-
-      if (server->check_origin && !check_host_origin(wsi)) {
-        lwsl_warn(
-            "refuse to serve WS client from different origin due to the "
-            "--check-origin option.\n");
-        return 1;
-      }
-      break;
-
-    case LWS_CALLBACK_ESTABLISHED:
-      pss->initialized = false;
-      pss->authenticated = false;
-      pss->wsi = wsi;
-      pss->lws_close_status = LWS_CLOSE_STATUS_NOSTATUS;
-
-      if (server->url_arg) {
-        while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
-          if (strncmp(buf, "arg=", 4) == 0) {
-            pss->args = xrealloc(pss->args, (pss->argc + 1) * sizeof(char *));
-            pss->args[pss->argc] = strdup(&buf[4]);
-            pss->argc++;
-          }
-        }
-      }
-
-      server->client_count++;
-
-      lws_get_peer_simple(lws_get_network_wsi(wsi), pss->address, sizeof(pss->address));
-      lwsl_notice("WS   %s - %s, clients: %d\n", pss->path, pss->address, server->client_count);
-      break;
-
-    case LWS_CALLBACK_SERVER_WRITEABLE:
-      if (!pss->initialized) {
-        if (pss->initial_cmd_index == sizeof(initial_cmds)) {
-          pss->initialized = true;
-          pty_resume(pss->process);
-          break;
-        }
-        if (send_initial_message(wsi, pss->initial_cmd_index) < 0) {
-          lwsl_err("failed to send initial message, index: %d\n", pss->initial_cmd_index);
-          lws_close_reason(wsi, LWS_CLOSE_STATUS_UNEXPECTED_CONDITION, NULL, 0);
-          return -1;
-        }
-        pss->initial_cmd_index++;
-        lws_callback_on_writable(wsi);
-        break;
-      }
-
-      if (pss->lws_close_status > LWS_CLOSE_STATUS_NOSTATUS) {
-        lws_close_reason(wsi, pss->lws_close_status, NULL, 0);
-        return 1;
-      }
-
-      if (pss->pty_buf != NULL) {
-        wsi_output(wsi, pss->pty_buf);
-        pty_buf_free(pss->pty_buf);
-        pss->pty_buf = NULL;
-        pty_resume(pss->process);
-      }
-      break;
-
-    case LWS_CALLBACK_RECEIVE:
-      if (pss->buffer == NULL) {
-        pss->buffer = xmalloc(len);
-        pss->len = len;
-        memcpy(pss->buffer, in, len);
-      } else {
-        pss->buffer = xrealloc(pss->buffer, pss->len + len);
-        memcpy(pss->buffer + pss->len, in, len);
-        pss->len += len;
-      }
-
-      const char command = pss->buffer[0];
-
-      // check auth
-      if (server->credential != NULL && !pss->authenticated && command != JSON_DATA) {
-        lwsl_warn("WS client not authenticated\n");
-        return 1;
-      }
-
-      // check if there are more fragmented messages
-      if (lws_remaining_packet_payload(wsi) > 0 || !lws_is_final_fragment(wsi)) {
-        return 0;
-      }
-
-      switch (command) {
-        case INPUT:
-          if (server->readonly) break;
-          int err = pty_write(pss->process, pty_buf_init(pss->buffer + 1, pss->len - 1));
-          if (err) {
-            lwsl_err("uv_write: %s (%s)\n", uv_err_name(err), uv_strerror(err));
-            return -1;
-          }
-          break;
-        case RESIZE_TERMINAL:
-          if (pss->process == NULL) break;
-          json_object_put(
-              parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows));
-          pty_resize(pss->process);
-          break;
-        case PAUSE:
-          pty_pause(pss->process);
-          break;
-        case RESUME:
-          pty_resume(pss->process);
-          break;
-        case JSON_DATA:
-          if (pss->process != NULL) break;
-          uint16_t columns = 0;
-          uint16_t rows = 0;
-          json_object *obj = parse_window_size(pss->buffer, pss->len, &columns, &rows);
-          if (server->credential != NULL) {
-            struct json_object *o = NULL;
-            if (json_object_object_get_ex(obj, "AuthToken", &o)) {
-              const char *token = json_object_get_string(o);
-              if (token != NULL && !strcmp(token, server->credential))
-                pss->authenticated = true;
-              else
-                lwsl_warn("WS authentication failed with token: %s\n", token);
-            }
-            if (!pss->authenticated) {
-              json_object_put(obj);
-              lws_close_reason(wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION, NULL, 0);
-              return -1;
-            }
-          }
-          json_object_put(obj);
-          if (!spawn_process(pss, columns, rows)) return 1;
-          break;
+    char cmd = initial_cmds[index];
+    switch(cmd) {
+        case SET_WINDOW_TITLE:
+            gethostname(buffer, sizeof(buffer) - 1);
+            n = sprintf((char *) p, "%c%s (%s)", cmd, server->command, buffer);
+            break;
+        case SET_PREFERENCES:
+            n = sprintf((char *) p, "%c%s", cmd, server->prefs_json);
+            break;
         default:
-          lwsl_warn("ignored unknown message type: %c\n", command);
-          break;
-      }
+            break;
+    }
 
-      if (pss->buffer != NULL) {
-        free(pss->buffer);
-        pss->buffer = NULL;
-      }
-      break;
+    return lws_write(wsi, p, (size_t) n, LWS_WRITE_BINARY);
+}
 
-    case LWS_CALLBACK_CLOSED:
-      if (pss->wsi == NULL) break;
+bool
+parse_window_size(const char *json, struct winsize *size) {
+    int columns, rows;
+    json_object *obj = json_tokener_parse(json);
+    struct json_object *o = NULL;
 
-      server->client_count--;
-      lwsl_notice("WS closed from %s, clients: %d\n", pss->address, server->client_count);
-      if (pss->buffer != NULL) free(pss->buffer);
-      if (pss->pty_buf != NULL) pty_buf_free(pss->pty_buf);
-      for (int i = 0; i < pss->argc; i++) {
-        free(pss->args[i]);
-      }
+    if (!json_object_object_get_ex(obj, "columns", &o)) {
+        lwsl_err("columns field not exists, json: %s\n", json);
+        return false;
+    }
+    columns = json_object_get_int(o);
+    if (!json_object_object_get_ex(obj, "rows", &o)) {
+        lwsl_err("rows field not exists, json: %s\n", json);
+        return false;
+    }
+    rows = json_object_get_int(o);
+    json_object_put(obj);
 
-      if (pss->process != NULL) {
-        ((pty_ctx_t *)pss->process->ctx)->ws_closed = true;
-        if (process_running(pss->process)) {
-          pty_pause(pss->process);
-          lwsl_notice("killing process, pid: %d\n", pss->process->pid);
-          pty_kill(pss->process, server->sig_code);
+    memset(size, 0, sizeof(struct winsize));
+    size->ws_col = (unsigned short) columns;
+    size->ws_row = (unsigned short) rows;
+
+    return true;
+}
+
+bool
+check_host_origin(struct lws *wsi) {
+    int origin_length = lws_hdr_total_length(wsi, WSI_TOKEN_ORIGIN);
+    char buf[origin_length + 1];
+    memset(buf, 0, sizeof(buf));
+    int len = lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_ORIGIN);
+    if (len <= 0) {
+        return false;
+    }
+
+    const char *prot, *address, *path;
+    int port;
+    if (lws_parse_uri(buf, &prot, &address, &port, &path))
+        return false;
+    if (port == 80 || port == 443) {
+        sprintf(buf, "%s", address);
+    } else {
+        sprintf(buf, "%s:%d", address, port);
+    }
+
+    int host_length = lws_hdr_total_length(wsi, WSI_TOKEN_HOST);
+    if (host_length != strlen(buf))
+        return false;
+    char host_buf[host_length + 1];
+    memset(host_buf, 0, sizeof(host_buf));
+    len = lws_hdr_copy(wsi, host_buf, sizeof(host_buf), WSI_TOKEN_HOST);
+
+    return len > 0 && strcasecmp(buf, host_buf) == 0;
+}
+
+void
+tty_client_remove(struct tty_client *client) {
+    pthread_mutex_lock(&server->mutex);
+    struct tty_client *iterator;
+    LIST_FOREACH(iterator, &server->clients, list) {
+        if (iterator == client) {
+            LIST_REMOVE(iterator, list);
+            server->client_count--;
+            break;
         }
-      }
+    }
+    pthread_mutex_unlock(&server->mutex);
+}
 
-      if (server->once && server->client_count == 0) {
-        lwsl_notice("exiting due to the --once option.\n");
-        force_exit = true;
-        lws_cancel_service(context);
-        exit(0);
-      }
-      break;
+void
+tty_client_destroy(struct tty_client *client) {
+    if (!client->running || client->pid <= 0)
+        goto cleanup;
 
-    default:
-      break;
-  }
+    client->running = false;
 
-  return 0;
+    if (pthread_mutex_trylock(&client->mutex) == 0) {
+        client->state = STATE_DONE;
+        pthread_cond_signal(&client->cond);
+        pthread_mutex_unlock(&client->mutex);
+    }
+
+    // kill process (group) and free resource
+    int pgid = getpgid(client->pid);
+    int pid = pgid > 0 ? -pgid : client->pid;
+    lwsl_notice("sending %s (%d) to process (group) %d\n", server->sig_name, server->sig_code, pid);
+    if (kill(pid, server->sig_code) != 0) {
+        lwsl_err("kill: %d, errno: %d (%s)\n", pid, errno, strerror(errno));
+    }
+    pid_t pid_out;
+    int status = wait_proc(client->pid, &pid_out);
+    if (pid_out > 0) {
+        lwsl_notice("process exited with code %d, pid: %d\n", status, pid_out);
+    }
+    close(client->pty);
+
+cleanup:
+    // free the buffer
+    if (client->buffer != NULL)
+        free(client->buffer);
+
+    for (int i = 0; i < client->argc; i++) {
+        free(client->args[i]);
+    }
+
+    pthread_mutex_destroy(&client->mutex);
+
+    // remove from client list
+    tty_client_remove(client);
+}
+
+void *
+thread_run_command(void *args) {
+    struct tty_client *client = (struct tty_client *) args;
+
+    // append url args to arguments
+    char *argv[server->argc + client->argc + 1];
+    int i, n = 0;
+    for (i = 0; i < server->argc; i++) {
+        argv[n++] = server->argv[i];
+    }
+    for (i = 0; i < client->argc; i++) {
+        argv[n++] = client->args[i];
+    }
+    argv[n] = NULL;
+
+    int pty;
+    fd_set des_set;
+    pid_t pid = forkpty(&pty, NULL, NULL, NULL);
+    if (pid < 0) { /* error */
+        lwsl_err("forkpty failed: %d (%s)\n", errno, strerror(errno));
+        pthread_exit((void *) 1);
+    } else if (pid == 0) { /* child */
+        setenv("TERM", server->terminal_type, true);
+        // Don't pass the web socket onto child processes
+        close(lws_get_socket_fd(client->wsi));
+        if (execvp(argv[0], argv) < 0) {
+            perror("execvp failed\n");
+            _exit(-errno);
+        }
+    }
+
+    lwsl_notice("started process, pid: %d\n", pid);
+    client->pid = pid;
+    client->pty = pty;
+    client->running = true;
+    if (client->size.ws_row > 0 && client->size.ws_col > 0)
+        ioctl(client->pty, TIOCSWINSZ, &client->size);
+
+    while (client->running) {
+        FD_ZERO (&des_set);
+        FD_SET (pty, &des_set);
+        struct timeval tv = { 1, 0 };
+        int ret = select(pty + 1, &des_set, NULL, NULL, &tv);
+        if (ret == 0) continue;
+        if (ret < 0) break;
+
+        if (FD_ISSET (pty, &des_set)) {
+            while (client->running) {
+                pthread_mutex_lock(&client->mutex);
+                while (client->state == STATE_READY) {
+                    pthread_cond_wait(&client->cond, &client->mutex);
+                }
+                memset(client->pty_buffer, 0, sizeof(client->pty_buffer));
+                client->pty_len = read(pty, client->pty_buffer + LWS_PRE + 1, BUF_SIZE);
+                client->state = STATE_READY;
+                pthread_mutex_unlock(&client->mutex);
+                break;
+            }
+        }
+
+        if (client->pty_len <= 0) break;
+    }
+
+    pthread_exit((void *) 0);
+}
+
+int
+callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
+             void *user, void *in, size_t len) {
+    struct tty_client *client = (struct tty_client *) user;
+    char buf[256];
+    size_t n = 0;
+
+    switch (reason) {
+        case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
+            if (server->once && server->client_count > 0) {
+                lwsl_warn("refuse to serve WS client due to the --once option.\n");
+                return 1;
+            }
+            if (server->max_clients > 0 && server->client_count == server->max_clients) {
+                lwsl_warn("refuse to serve WS client due to the --max-clients option.\n");
+                return 1;
+            }
+            if (lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_GET_URI) <= 0 || strcmp(buf, WS_PATH) != 0) {
+                lwsl_warn("refuse to serve WS client for illegal ws path: %s\n", buf);
+                return 1;
+            }
+
+            if (server->check_origin && !check_host_origin(wsi)) {
+                lwsl_warn("refuse to serve WS client from different origin due to the --check-origin option.\n");
+                return 1;
+            }
+            break;
+
+        case LWS_CALLBACK_ESTABLISHED:
+            client->running = false;
+            client->initialized = false;
+            client->initial_cmd_index = 0;
+            client->authenticated = false;
+            client->wsi = wsi;
+            client->buffer = NULL;
+            client->state = STATE_INIT;
+            client->pty_len = 0;
+            client->argc = 0;
+
+            if (server->url_arg) {
+                while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
+                    if (strncmp(buf, "arg=", 4) == 0) {
+                        client->args = xrealloc(client->args, (client->argc + 1) * sizeof(char *));
+                        client->args[client->argc] = strdup(&buf[4]);
+                        client->argc++;
+                    }
+                }
+            }
+
+            pthread_mutex_init(&client->mutex, NULL);
+            pthread_cond_init(&client->cond, NULL);
+            lws_get_peer_addresses(wsi, lws_get_socket_fd(wsi),
+                                   client->hostname, sizeof(client->hostname),
+                                   client->address, sizeof(client->address));
+
+            pthread_mutex_lock(&server->mutex);
+            LIST_INSERT_HEAD(&server->clients, client, list);
+            server->client_count++;
+            pthread_mutex_unlock(&server->mutex);
+
+            lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_GET_URI);
+            lwsl_notice("WS   %s - %s (%s), clients: %d\n", buf, client->address, client->hostname, server->client_count);
+            break;
+
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            if (!client->initialized) {
+                if (client->initial_cmd_index == sizeof(initial_cmds)) {
+                    client->initialized = true;
+                    break;
+                }
+                if (send_initial_message(wsi, client->initial_cmd_index) < 0) {
+                    lwsl_err("failed to send initial message, index: %d\n", client->initial_cmd_index);
+                    lws_close_reason(wsi, LWS_CLOSE_STATUS_UNEXPECTED_CONDITION, NULL, 0);
+                    return -1;
+                }
+                client->initial_cmd_index++;
+                lws_callback_on_writable(wsi);
+                break;
+            }
+            if (client->state != STATE_READY)
+                break;
+
+            // read error or client exited, close connection
+            if (client->pty_len == 0) {
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, NULL, 0);
+                return 1;
+            } else if (client->pty_len < 0) {
+                lwsl_err("read error: %d (%s)\n", errno, strerror(errno));
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_UNEXPECTED_CONDITION, NULL, 0);
+                return -1;
+            }
+
+            client->pty_buffer[LWS_PRE] = OUTPUT;
+            n = (size_t) (client->pty_len + 1);
+            if (lws_write(wsi, (unsigned char *) client->pty_buffer + LWS_PRE, n, LWS_WRITE_BINARY) < n) {
+                lwsl_err("write data to WS\n");
+            }
+            client->state = STATE_DONE;
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            if (client->buffer == NULL) {
+                client->buffer = xmalloc(len);
+                client->len = len;
+                memcpy(client->buffer, in, len);
+            } else {
+                client->buffer = xrealloc(client->buffer, client->len + len);
+                memcpy(client->buffer + client->len, in, len);
+                client->len += len;
+            }
+
+            const char command = client->buffer[0];
+
+            // check auth
+            if (server->credential != NULL && !client->authenticated && command != JSON_DATA) {
+                lwsl_warn("WS client not authenticated\n");
+                return 1;
+            }
+
+            // check if there are more fragmented messages
+            if (lws_remaining_packet_payload(wsi) > 0 || !lws_is_final_fragment(wsi)) {
+                return 0;
+            }
+
+            switch (command) {
+                case INPUT:
+                    if (client->pty == 0)
+                        break;
+                    if (server->readonly)
+                        return 0;
+                    if (write(client->pty, client->buffer + 1, client->len - 1) == -1) {
+                        lwsl_err("write INPUT to pty: %d (%s)\n", errno, strerror(errno));
+                        lws_close_reason(wsi, LWS_CLOSE_STATUS_UNEXPECTED_CONDITION, NULL, 0);
+                        return -1;
+                    }
+                    break;
+                case RESIZE_TERMINAL:
+                    if (parse_window_size(client->buffer + 1, &client->size) && client->pty > 0) {
+                        if (ioctl(client->pty, TIOCSWINSZ, &client->size) == -1) {
+                            lwsl_err("ioctl TIOCSWINSZ: %d (%s)\n", errno, strerror(errno));
+                        }
+                    }
+                    break;
+                case JSON_DATA:
+                    if (client->pid > 0)
+                        break;
+                    if (server->credential != NULL) {
+                        json_object *obj = json_tokener_parse(client->buffer);
+                        struct json_object *o = NULL;
+                        if (json_object_object_get_ex(obj, "AuthToken", &o)) {
+                            const char *token = json_object_get_string(o);
+                            if (token != NULL && !strcmp(token, server->credential))
+                                client->authenticated = true;
+                            else
+                                lwsl_warn("WS authentication failed with token: %s\n", token);
+                        }
+                        if (!client->authenticated) {
+                            lws_close_reason(wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION, NULL, 0);
+                            return -1;
+                        }
+                    }
+                    int err = pthread_create(&client->thread, NULL, thread_run_command, client);
+                    if (err != 0) {
+                        lwsl_err("pthread_create return: %d\n", err);
+                        return 1;
+                    }
+                    break;
+                default:
+                    lwsl_warn("ignored unknown message type: %c\n", command);
+                    break;
+            }
+
+            if (client->buffer != NULL) {
+                free(client->buffer);
+                client->buffer = NULL;
+            }
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            tty_client_destroy(client);
+            lwsl_notice("WS closed from %s (%s), clients: %d\n", client->address, client->hostname, server->client_count);
+            if (server->once && server->client_count == 0) {
+                lwsl_notice("exiting due to the --once option.\n");
+                force_exit = true;
+                lws_cancel_service(context);
+                exit(0);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
 }
